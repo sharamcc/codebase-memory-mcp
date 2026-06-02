@@ -332,7 +332,18 @@ static const tool_def_t TOOLS[] = {
      "Execute a Cypher query against the knowledge graph for complex multi-hop patterns, "
      "aggregations, and cross-service analysis. The response includes 'total' (returned "
      "row count). There is a hard 100k row ceiling — for broad queries add LIMIT in the "
-     "Cypher itself or use search_graph + offset/limit pagination instead.",
+     "Cypher itself or use search_graph + offset/limit pagination instead. "
+     "COMPLEXITY / BOTTLENECKS: every Function and Method node carries queryable complexity "
+     "properties — cyclomatic (complexity), cognitive, loop_count, loop_depth (max nested-loop "
+     "depth, a polynomial-degree proxy), plus interprocedural transitive_loop_depth (worst-case "
+     "nested-loop degree propagated along CALLS edges) and a recursive flag. Additional "
+     "hot-path signals: linear_scan_in_loop (count of find/contains/indexOf-style scans inside a "
+     "loop — the hidden O(n^2) that loop_depth misses), alloc_in_loop (allocations/appends inside "
+     "a loop), recursion_in_loop (a self-call inside a loop), unguarded_recursion (recursion with "
+     "no conditionally-guarded base case), param_count and max_access_depth (structure smells). "
+     "Find all hot-path candidates in one query, e.g. MATCH (f:Function) WHERE "
+     "f.transitive_loop_depth >= 3 OR f.linear_scan_in_loop >= 1 RETURN f.qualified_name, "
+     "f.transitive_loop_depth, f.linear_scan_in_loop ORDER BY f.transitive_loop_depth DESC.",
      "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"Cypher "
      "query\"},\"project\":{\"type\":\"string\"},\"max_rows\":{\"type\":\"integer\","
      "\"description\":"
@@ -374,7 +385,10 @@ static const tool_def_t TOOLS[] = {
 
     {"get_architecture",
      "Get high-level architecture overview — packages, services, dependencies, and project "
-     "structure at a glance.",
+     "structure at a glance. Includes 'clusters': Leiden community detection over the call/import "
+     "graph, surfacing the de-facto modules (each with a label, member count, cohesion score, "
+     "representative top_nodes, and the packages/edge_types that bind it) — use these to grasp "
+     "the real architectural seams, which often cut across the folder layout.",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"aspects\":{\"type\":"
      "\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[\"project\"]}"},
 

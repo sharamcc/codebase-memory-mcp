@@ -5,6 +5,7 @@
  * on a temporary directory with known file layout.
  */
 #include "../src/foundation/compat.h"
+#include "foundation/platform.h" // cbm_normalize_path_sep (drive-canonicalization regression)
 #include "test_framework.h"
 #include "test_helpers.h"
 #include "pipeline/pipeline.h"
@@ -1953,6 +1954,34 @@ TEST(project_name_from_path) {
         ASSERT_STR_EQ(got, cases[i].want);
         free(got);
     }
+    PASS();
+}
+
+/* Regression for #394/#227/#367: a Windows drive letter is case-insensitive, so
+ * "c:/repo" and "C:/repo" must canonicalize to the SAME project key. Otherwise
+ * agent CWDs (which report lowercase "c:\...") produce a distinct key + colliding
+ * cache file that clobbers the good index, and the lowercase index self-deletes.
+ * Pure string logic, so it reproduces on any platform. */
+TEST(project_name_drive_letter_case_insensitive_issue394) {
+    char *lower = cbm_project_name_from_path("c:/WEBDEV/Cardio-Cloud");
+    char *upper = cbm_project_name_from_path("C:/WEBDEV/Cardio-Cloud");
+    ASSERT_NOT_NULL(lower);
+    ASSERT_NOT_NULL(upper);
+    /* Both must fold to the upper-case-drive key, e.g. "C-WEBDEV-Cardio-Cloud". */
+    ASSERT_STR_EQ(lower, upper);
+    ASSERT_EQ(lower[0], 'C');
+    free(lower);
+    free(upper);
+
+    /* And the normalizer itself upper-cases the drive root in place. */
+    char buf1[32];
+    snprintf(buf1, sizeof(buf1), "%s", "c:/x");
+    cbm_normalize_path_sep(buf1);
+    ASSERT_STR_EQ(buf1, "C:/x");
+    char buf2[32];
+    snprintf(buf2, sizeof(buf2), "%s", "d:\\proj\\sub");
+    cbm_normalize_path_sep(buf2);
+    ASSERT_STR_EQ(buf2, "D:/proj/sub");
     PASS();
 }
 
@@ -5393,6 +5422,90 @@ TEST(project_name_trailing_slash) {
     PASS();
 }
 
+/* ── Complexity propagation pass tests (Tier B) ────────────────── */
+
+/* Find the first Function/Method node with `name` in a label set. Returns a
+ * borrowed pointer into `funcs` or NULL. */
+static const cbm_node_t *find_node_named(cbm_node_t *funcs, int count, const char *name) {
+    for (int i = 0; i < count; i++) {
+        if (strcmp(funcs[i].name, name) == 0)
+            return &funcs[i];
+    }
+    return NULL;
+}
+
+/* The complexity pass propagates loop_depth along CALLS edges into
+ * transitive_loop_depth and flags call-graph cycles as recursive. Caller and
+ * callee live in one file so the calls resolve intra-file (most reliable). */
+TEST(pipeline_complexity_transitive_loop_depth) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_cx_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        SKIP("tmpdir");
+
+    write_temp_file(tmpdir, "cx.go",
+                    "package p\n\n"
+                    "func work() {}\n\n"
+                    "func inner() {\n"
+                    "\tfor i := 0; i < 10; i++ {\n"
+                    "\t\tfor j := 0; j < 10; j++ {\n"
+                    "\t\t\twork()\n"
+                    "\t\t}\n"
+                    "\t}\n"
+                    "}\n\n"
+                    "func outer() {\n"
+                    "\tfor i := 0; i < 10; i++ {\n"
+                    "\t\tinner()\n"
+                    "\t}\n"
+                    "}\n\n"
+                    "func recur(n int) {\n"
+                    "\tif n > 0 {\n"
+                    "\t\trecur(n - 1)\n"
+                    "\t}\n"
+                    "}\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/cx.db", tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_node_t *funcs = NULL;
+    int func_count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_label(s, project, "Function", &funcs, &func_count),
+              CBM_STORE_OK);
+    ASSERT_GT(func_count, 0);
+
+    /* inner: two nested loops, callee work() has depth 0 → tld == 2 */
+    const cbm_node_t *inner = find_node_named(funcs, func_count, "inner");
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(inner->properties_json);
+    ASSERT_TRUE(strstr(inner->properties_json, "\"transitive_loop_depth\":2") != NULL);
+
+    /* outer: own depth 1 + inner's tld 2 → tld == 3 (interprocedural) */
+    const cbm_node_t *outer = find_node_named(funcs, func_count, "outer");
+    ASSERT_NOT_NULL(outer);
+    ASSERT_NOT_NULL(outer->properties_json);
+    ASSERT_TRUE(strstr(outer->properties_json, "\"transitive_loop_depth\":3") != NULL);
+
+    /* recur: self-recursion → recursive:true flagged by the cycle guard */
+    const cbm_node_t *recur = find_node_named(funcs, func_count, "recur");
+    ASSERT_NOT_NULL(recur);
+    ASSERT_NOT_NULL(recur->properties_json);
+    ASSERT_TRUE(strstr(recur->properties_json, "\"recursive\":true") != NULL);
+
+    cbm_store_free_nodes(funcs, func_count);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
 SUITE(pipeline) {
     /* Index lock */
     RUN_TEST(pipeline_lock_try_acquire);
@@ -5418,6 +5531,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_definitions_function_nodes);
     RUN_TEST(pipeline_definitions_defines_edges);
     RUN_TEST(pipeline_definitions_properties);
+    /* Complexity propagation pass (Tier B) */
+    RUN_TEST(pipeline_complexity_transitive_loop_depth);
     /* Calls pass */
     RUN_TEST(pipeline_calls_resolution);
     /* Git history pass */
@@ -5457,6 +5572,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_docstring_go_class);
     /* Project name */
     RUN_TEST(project_name_from_path);
+    RUN_TEST(project_name_drive_letter_case_insensitive_issue394);
     RUN_TEST(project_name_uniqueness);
     /* Git diff helpers */
     RUN_TEST(gitdiff_parse_range_with_count);

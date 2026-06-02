@@ -448,6 +448,9 @@ static void predump_sem(cbm_pipeline_ctx_t *ctx) {
 static void predump_cfg(cbm_pipeline_ctx_t *ctx) {
     cbm_pipeline_pass_configlink(ctx);
 }
+static void predump_complexity(cbm_pipeline_ctx_t *ctx) {
+    cbm_pipeline_pass_complexity(ctx);
+}
 
 static void run_predump_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
     static const struct {
@@ -457,9 +460,9 @@ static void run_predump_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
     } passes[] = {
         {predump_deco, "decorator_tags", false}, {predump_cfg, "configlink", false},
         {predump_route, "route_match", false},   {predump_sim, "similarity", true},
-        {predump_sem, "semantic_edges", true},
+        {predump_sem, "semantic_edges", true},    {predump_complexity, "complexity", false},
     };
-    enum { PREDUMP_PASS_COUNT = 5 };
+    enum { PREDUMP_PASS_COUNT = 6 };
     struct timespec t;
     for (int i = 0; i < PREDUMP_PASS_COUNT && !check_cancel(p); i++) {
         /* "moderate_only" passes (similarity/semantic edges) run in FULL,
@@ -914,6 +917,11 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     struct timespec t0;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t0);
     cbm_path_alias_collection_t *path_aliases = NULL;
+
+    /* C/C++ #define Macro nodes (#375) dominate extraction on macro-dense repos
+     * (≈49% of nodes on the Linux kernel), so gate them to full mode — moderate
+     * and fast skip them entirely. Set before any extraction dispatch. */
+    cbm_set_macro_extraction(p->mode == CBM_MODE_FULL);
 
     /* Load user-defined extension overrides (fail-open: NULL on error) */
     CBM_PROF_START(t_userconfig);

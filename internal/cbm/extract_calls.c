@@ -727,6 +727,9 @@ void handle_calls(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Walk
             CBMCall call = {0};
             call.callee_name = callee;
             call.enclosing_func_qn = state->enclosing_func_qn;
+            call.loop_depth = state->loop_depth;     // enclosing loop nesting at this call
+            call.branch_depth = state->branch_depth; // enclosing branch nesting at this call
+            call.start_line = (int)ts_node_start_point(node).row + TS_LINE_OFFSET;
 
             TSNode args = ts_node_child_by_field_name(node, TS_FIELD("arguments"));
             if (!ts_node_is_null(args)) {

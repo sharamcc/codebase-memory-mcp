@@ -472,6 +472,12 @@ int cbm_pipeline_pass_similarity(cbm_pipeline_ctx_t *ctx);
  * Opt-in: only runs when CBM_SEMANTIC_ENABLED=1. */
 int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx);
 
+/* Pre-dump pass: interprocedural complexity propagation (Tier B).
+ * Propagates per-function loop_depth along CALLS edges into a transitive
+ * worst-case nested-loop estimate (transitive_loop_depth) and flags call-graph
+ * cycles (recursive). Runs on the graph buffer before the dump. */
+void cbm_pipeline_pass_complexity(cbm_pipeline_ctx_t *ctx);
+
 /* ── Env URL scanner (pass_envscan.c) ────────────────────────────── */
 
 typedef struct {

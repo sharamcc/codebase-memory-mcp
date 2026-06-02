@@ -1671,6 +1671,17 @@ static void resolve_cpp_trailing_return(CBMArena *a, TSNode func_node, const cha
     }
 }
 
+/* Compute and store the structural complexity metrics for a definition. */
+static void set_def_complexity(CBMDefinition *def, TSNode body, const CBMLangSpec *spec) {
+    cbm_complexity_t cx;
+    cbm_compute_complexity(body, spec->branching_node_types, &cx);
+    def->complexity = cx.cyclomatic;
+    def->cognitive = cx.cognitive;
+    def->loop_count = cx.loop_count;
+    def->loop_depth = cx.loop_depth;
+    def->max_access_depth = cx.max_access_depth;
+}
+
 static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
     CBMArena *a = ctx->arena;
 
@@ -1744,7 +1755,7 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
 
     // Complexity
     if (spec->branching_node_types && spec->branching_node_types[0]) {
-        def.complexity = cbm_count_branching(node, spec->branching_node_types);
+        set_def_complexity(&def, node, spec);
     }
 
     // MinHash fingerprint
@@ -2277,7 +2288,7 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, const char *class_
     def.docstring = extract_docstring(a, child, ctx->source, ctx->language);
 
     if (spec->branching_node_types && spec->branching_node_types[0]) {
-        def.complexity = cbm_count_branching(child, spec->branching_node_types);
+        set_def_complexity(&def, child, spec);
     }
 
     // MinHash fingerprint
@@ -2425,7 +2436,7 @@ static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
         }
 
         if (spec->branching_node_types && spec->branching_node_types[0]) {
-            def.complexity = cbm_count_branching(child, spec->branching_node_types);
+            set_def_complexity(&def, child, spec);
         }
 
         // MinHash fingerprint
@@ -3829,7 +3840,11 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
 
         if (is_c_preprocessor_lang(ctx->language) &&
             (strcmp(kind, "preproc_def") == 0 || strcmp(kind, "preproc_function_def") == 0)) {
-            extract_c_macro_def(ctx, node);
+            // Gated to full/advanced index modes — macros dominate extraction on
+            // macro-dense codebases (e.g. the Linux kernel). See #375.
+            if (cbm_macro_extraction_enabled()) {
+                extract_c_macro_def(ctx, node);
+            }
             continue; // the macro body is a preproc_arg — nothing more to extract
         }
 
