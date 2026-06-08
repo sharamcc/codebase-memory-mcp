@@ -1061,6 +1061,8 @@ static const char *extract_docstring(CBMArena *a, TSNode node, const char *sourc
     return NULL;
 }
 
+static TSNode find_jvm_modifiers(TSNode node, CBMLanguage lang);
+
 /* HTTP method names recognized in decorator calls (e.g., @router.post → "POST") */
 static const char *decorator_method_name(const char *attr_text) {
     if (!attr_text) {
@@ -1086,6 +1088,39 @@ static const char *decorator_method_name(const char *attr_text) {
     }
     if (strcmp(method, "route") == 0 || strcmp(method, "api_route") == 0) {
         return "ANY";
+    }
+    return NULL;
+}
+
+/* HTTP method for a Spring/JAX-RS style annotation name (e.g. "GetMapping" →
+ * "GET", "RequestMapping" → "ANY", JAX-RS "GET" → "GET"). Returns NULL when the
+ * annotation is not a route-mapping annotation. */
+static const char *annotation_route_method(const char *name) {
+    if (!name) {
+        return NULL;
+    }
+    if (strcmp(name, "GetMapping") == 0) {
+        return "GET";
+    }
+    if (strcmp(name, "PostMapping") == 0) {
+        return "POST";
+    }
+    if (strcmp(name, "PutMapping") == 0) {
+        return "PUT";
+    }
+    if (strcmp(name, "DeleteMapping") == 0) {
+        return "DELETE";
+    }
+    if (strcmp(name, "PatchMapping") == 0) {
+        return "PATCH";
+    }
+    if (strcmp(name, "RequestMapping") == 0) {
+        return "ANY";
+    }
+    /* JAX-RS bare-verb annotations (@GET/@POST/...) — path comes from @Path. */
+    if (strcmp(name, "GET") == 0 || strcmp(name, "POST") == 0 || strcmp(name, "PUT") == 0 ||
+        strcmp(name, "DELETE") == 0 || strcmp(name, "PATCH") == 0) {
+        return name;
     }
     return NULL;
 }
@@ -1167,6 +1202,66 @@ static bool try_route_from_decorator_call(CBMArena *a, TSNode dchild, const char
     return true;
 }
 
+/* Try to extract a route from a Java/JVM annotation node (`annotation` or
+ * `marker_annotation`). Spring mapping annotations carry the HTTP method in the
+ * annotation name and the path in the (optional) argument list:
+ *   @GetMapping("/orders")  @RequestMapping(value="/api")  @PostMapping
+ * Returns true when the annotation is a route-mapping annotation. */
+static bool try_route_from_annotation(CBMArena *a, TSNode annotation, const char *source,
+                                      const char **out_path, const char **out_method) {
+    TSNode name_node = ts_node_child_by_field_name(annotation, TS_FIELD("name"));
+    if (ts_node_is_null(name_node)) {
+        return false;
+    }
+    char *name = cbm_node_text(a, name_node, source);
+    const char *method = annotation_route_method(name);
+    if (!method) {
+        return false;
+    }
+    TSNode args = ts_node_child_by_field_name(annotation, TS_FIELD("arguments"));
+    if (ts_node_is_null(args)) {
+        args = find_decorator_args(annotation);
+    }
+    const char *path = NULL;
+    if (!ts_node_is_null(args)) {
+        path = extract_route_path_from_args(a, args, source);
+    }
+    *out_path = path ? path : "/";
+    *out_method = method;
+    return true;
+}
+
+/* Scan the annotation nodes nested in a JVM/C# `modifiers`/`attribute_list`
+ * wrapper (and direct children) for a route-mapping annotation. Java/Kotlin
+ * Spring annotations (@GetMapping, @RequestMapping, ...) live here rather than
+ * as prev-siblings, so the prev-sibling decorator walk never sees them. */
+static bool extract_route_from_annotations(CBMArena *a, TSNode func_node, const char *source,
+                                           const CBMLangSpec *spec, const char **out_path,
+                                           const char **out_method) {
+    TSNode modifiers = find_jvm_modifiers(func_node, spec->language);
+    if (!ts_node_is_null(modifiers)) {
+        uint32_t mc = ts_node_child_count(modifiers);
+        for (uint32_t mi = 0; mi < mc; mi++) {
+            TSNode mchild = ts_node_child(modifiers, mi);
+            if (cbm_kind_in_set(mchild, spec->decorator_node_types) &&
+                try_route_from_annotation(a, mchild, source, out_path, out_method)) {
+                return true;
+            }
+        }
+    }
+    /* Direct-child annotations (some grammars attach the annotation as a child
+     * of the method node rather than under `modifiers`). */
+    uint32_t cc = ts_node_child_count(func_node);
+    for (uint32_t ci = 0; ci < cc; ci++) {
+        TSNode child = ts_node_child(func_node, ci);
+        if (cbm_kind_in_set(child, spec->decorator_node_types) &&
+            try_route_from_annotation(a, child, source, out_path, out_method)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void extract_route_from_decorators(CBMArena *a, TSNode func_node, const char *source,
                                           const CBMLangSpec *spec, const char **out_path,
                                           const char **out_method) {
@@ -1193,8 +1288,17 @@ static void extract_route_from_decorators(CBMArena *a, TSNode func_node, const c
                 return;
             }
         }
+        /* JVM/C# annotation-form route mapping (Spring @GetMapping etc.) — the
+         * prev-sibling itself may be the annotation node. */
+        if (try_route_from_annotation(a, prev, source, out_path, out_method)) {
+            return;
+        }
         prev = ts_node_prev_sibling(prev);
     }
+
+    /* Spring/JAX-RS annotations live inside the method's `modifiers` child, not
+     * as prev-siblings — scan there too. */
+    extract_route_from_annotations(a, func_node, source, spec, out_path, out_method);
 }
 
 // Extract decorator names from preceding decorator/annotation nodes

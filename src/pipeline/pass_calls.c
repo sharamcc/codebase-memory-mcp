@@ -198,9 +198,11 @@ static void handle_route_registration(cbm_pipeline_ctx_t *ctx, const CBMCall *ca
              "{\"callee\":\"%s\",\"url_path\":\"%s\",\"via\":\"route_registration\"}",
              call->callee_name, call->first_string_arg);
     cbm_gbuf_insert_edge(ctx->gbuf, source_node->id, route_id, "CALLS", props);
+    if (getenv("CBM_DBG_ROUTE")) fprintf(stderr, "[DBG] route_reg callee=%s path=%s handler=%s\n", call->callee_name, call->first_string_arg, call->second_arg_name?call->second_arg_name:"(null)");
     if (call->second_arg_name != NULL && call->second_arg_name[0] != '\0') {
         cbm_resolution_t hres = cbm_registry_resolve(ctx->registry, call->second_arg_name,
                                                      module_qn, imp_keys, imp_vals, imp_count);
+        if (getenv("CBM_DBG_ROUTE")) fprintf(stderr, "[DBG] handler '%s' resolved=%s\n", call->second_arg_name, hres.qualified_name?hres.qualified_name:"(null)");
         if (hres.qualified_name != NULL && hres.qualified_name[0] != '\0') {
             const cbm_gbuf_node_t *handler = cbm_gbuf_find_by_qn(ctx->gbuf, hres.qualified_name);
             if (handler != NULL) {
@@ -281,6 +283,8 @@ static void emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
                                  const cbm_resolution_t *res, const char *module_qn,
                                  const char **imp_keys, const char **imp_vals, int imp_count) {
     cbm_svc_kind_t svc = cbm_service_pattern_match(res->qualified_name);
+    if (getenv("CBM_DBG_SVC") && call->callee_name && (strstr(call->callee_name,"Route")||strstr(call->callee_name,"client")||strstr(call->callee_name,"Client")||strstr(call->callee_name,"RestClient")))
+        fprintf(stderr, "[DBGSVC] callee=%s resolved=%s svc=%d strarg=%s\n", call->callee_name, res->qualified_name?res->qualified_name:"(null)", svc, call->first_string_arg?call->first_string_arg:"(null)");
     if (svc == CBM_SVC_ROUTE_REG && call->first_string_arg && call->first_string_arg[0] == '/') {
         handle_route_registration(ctx, call, source, module_qn, imp_keys, imp_vals, imp_count);
         return;

@@ -7,6 +7,8 @@
 #include "extract_node_stack.h"
 #include "tree_sitter/api.h" // TSNode, ts_node_*
 #include <stdint.h>          // uint32_t
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 
@@ -935,6 +937,11 @@ static const char *extract_url_or_topic_arg(CBMExtractCtx *ctx, TSNode args) {
     uint32_t nc = ts_node_named_child_count(args);
     for (uint32_t ai = 0; ai < nc; ai++) {
         TSNode arg = ts_node_named_child(args, ai);
+        /* PHP and C# wrap each positional argument in an `argument` node;
+         * unwrap to the underlying value so the URL string is reachable. */
+        if (strcmp(ts_node_type(arg), "argument") == 0 && ts_node_named_child_count(arg) > 0) {
+            arg = ts_node_named_child(arg, 0);
+        }
         const char *ak = ts_node_type(arg);
 
         if (strcmp(ak, "keyword_argument") == 0 || strcmp(ak, "pair") == 0) {
@@ -956,15 +963,45 @@ static const char *extract_url_or_topic_arg(CBMExtractCtx *ctx, TSNode args) {
 }
 
 // Extract second argument name (handler ref for route registrations).
+/* Normalize a string-form route handler to a resolvable handler name.
+ *   'showUsers'              → showUsers
+ *   'UserController@show'    → show   (Laravel "Controller@method")
+ * The method segment after '@' is the resolvable function/method name. */
+static const char *normalize_string_handler(CBMArena *a, const char *raw) {
+    const char *unq = strip_quotes(a, raw);
+    if (!unq || !unq[0]) {
+        return NULL;
+    }
+    const char *at = strchr(unq, '@');
+    if (at && at[1]) {
+        return cbm_arena_strdup(a, at + 1);
+    }
+    return unq;
+}
+
 static const char *extract_handler_arg(CBMExtractCtx *ctx, TSNode args) {
     uint32_t nc = ts_node_named_child_count(args);
     for (uint32_t ai = HANDLER_START_IDX; ai < nc && ai < MAX_HANDLER_SCAN; ai++) {
         TSNode arg2 = ts_node_named_child(args, ai);
+        /* PHP wraps each argument in an `argument` node — unwrap to the value. */
+        if (strcmp(ts_node_type(arg2), "argument") == 0 &&
+            ts_node_named_child_count(arg2) > 0) {
+            arg2 = ts_node_named_child(arg2, 0);
+        }
         const char *ak2 = ts_node_type(arg2);
+        /* `name` = PHP bare identifier handler; string = Laravel string handler
+         * ('showUsers' or 'Controller@method'). */
         if (strcmp(ak2, "identifier") == 0 || strcmp(ak2, "member_expression") == 0 ||
             strcmp(ak2, "selector_expression") == 0 || strcmp(ak2, "attribute") == 0 ||
-            strcmp(ak2, "field_expression") == 0) {
+            strcmp(ak2, "field_expression") == 0 || strcmp(ak2, "name") == 0) {
             return cbm_node_text(ctx->arena, arg2, ctx->source);
+        }
+        if (is_string_like(ak2)) {
+            const char *h = normalize_string_handler(ctx->arena,
+                                                     cbm_node_text(ctx->arena, arg2, ctx->source));
+            if (h && h[0]) {
+                return h;
+            }
         }
     }
     return NULL;
@@ -1005,6 +1042,11 @@ void handle_calls(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Walk
             call.start_line = (int)ts_node_start_point(node).row + TS_LINE_OFFSET;
 
             TSNode args = ts_node_child_by_field_name(node, TS_FIELD("arguments"));
+            if (getenv("CBM_DBG_ARGS") && callee && (strstr(callee,"get")||strstr(callee,"Get")||strstr(callee,"client")||strstr(callee,"Route"))) {
+                fprintf(stderr, "[DBGARGS] callee=%s node=%s args_null=%d", callee, ts_node_type(node), ts_node_is_null(args));
+                if (!ts_node_is_null(args)) { uint32_t n=ts_node_named_child_count(args); fprintf(stderr, " nargs=%u:", n); for(uint32_t i=0;i<n&&i<4;i++) fprintf(stderr," [%s]",ts_node_type(ts_node_named_child(args,i))); }
+                fprintf(stderr, "\n");
+            }
             if (!ts_node_is_null(args)) {
                 call.first_string_arg = extract_url_or_topic_arg(ctx, args);
                 if (call.first_string_arg && call.first_string_arg[0] == '/') {
