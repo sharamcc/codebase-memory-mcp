@@ -1651,6 +1651,51 @@ static void extract_kotlin_operator_call(CBMExtractCtx *ctx, TSNode node, const 
     cbm_calls_push(&ctx->result->calls, ctx->arena, call);
 }
 
+// Kotlin convention-desugared calls that the call walk never sees as
+// call_expressions: `val (a,b) = e` -> e.component1()/e.component2(); and
+// `for (x in e)` -> e.iterator()/hasNext()/next(). Record textual calls to those
+// operator-convention method names so the LSP's lsp_kt_destructure /
+// lsp_kt_iterator resolutions have a call site to join (names match the LSP's).
+static void kt_push_implicit_call(CBMExtractCtx *ctx, TSNode node, const char *callee,
+                                  const char *enclosing_func_qn) {
+    CBMCall call = {0};
+    call.callee_name = callee;
+    call.enclosing_func_qn = enclosing_func_qn;
+    call.start_line = (int)ts_node_start_point(node).row + TS_LINE_OFFSET;
+    cbm_calls_push(&ctx->result->calls, ctx->arena, call);
+}
+
+static void extract_kotlin_desugared_calls(CBMExtractCtx *ctx, TSNode node, const char *kind,
+                                           const char *enclosing_func_qn) {
+    if (strcmp(kind, "property_declaration") == 0) {
+        uint32_t nc = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < nc; i++) {
+            TSNode c = ts_node_named_child(node, i);
+            if (strcmp(ts_node_type(c), "multi_variable_declaration") != 0) {
+                continue;
+            }
+            // One componentN() call per destructured variable.
+            uint32_t vc = ts_node_named_child_count(c);
+            uint32_t comp = 0;
+            for (uint32_t j = 0; j < vc; j++) {
+                TSNode v = ts_node_named_child(c, j);
+                if (strcmp(ts_node_type(v), "variable_declaration") != 0) {
+                    continue;
+                }
+                comp++;
+                kt_push_implicit_call(ctx, node,
+                                      cbm_arena_sprintf(ctx->arena, "component%u", comp),
+                                      enclosing_func_qn);
+            }
+            break;
+        }
+    } else if (strcmp(kind, "for_statement") == 0) {
+        kt_push_implicit_call(ctx, node, "iterator", enclosing_func_qn);
+        kt_push_implicit_call(ctx, node, "hasNext", enclosing_func_qn);
+        kt_push_implicit_call(ctx, node, "next", enclosing_func_qn);
+    }
+}
+
 void handle_calls(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, WalkState *state) {
     if (!spec->call_node_types || !spec->call_node_types[0]) {
         return;
@@ -1713,5 +1758,6 @@ void handle_calls(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Walk
 
     if (ctx->language == CBM_LANG_KOTLIN) {
         extract_kotlin_operator_call(ctx, node, ts_node_type(node), state->enclosing_func_qn);
+        extract_kotlin_desugared_calls(ctx, node, ts_node_type(node), state->enclosing_func_qn);
     }
 }
