@@ -32,6 +32,7 @@ enum {
     MCP_URI_PREFIX = 7,      /* strlen("file://") */
     MCP_CONTENT_PREFIX = 15, /* strlen("Content-Length:") */
     MCP_RETURN_2 = 2,
+    MCP_TOOLS_PAGE_SIZE = 8,
 };
 #define MCP_MS_TO_US 1000LL
 #define MCP_S_TO_US 1000000LL
@@ -249,29 +250,66 @@ char *cbm_mcp_text_result(const char *text, bool is_error) {
     yyjson_mut_val *content = yyjson_mut_arr(doc);
     yyjson_mut_val *item = yyjson_mut_obj(doc);
     yyjson_mut_obj_add_str(doc, item, "type", "text");
-    yyjson_mut_obj_add_str(doc, item, "text", text);
+    yyjson_mut_obj_add_str(doc, item, "text", text ? text : "");
     yyjson_mut_arr_add_val(content, item);
     yyjson_mut_obj_add_val(doc, root, "content", content);
 
-    if (is_error) {
-        yyjson_mut_obj_add_bool(doc, root, "isError", true);
+    if (!is_error && text) {
+        yyjson_doc *structured_doc = yyjson_read(text, strlen(text), 0);
+        if (structured_doc) {
+            yyjson_val *structured_root = yyjson_doc_get_root(structured_doc);
+            if (yyjson_is_obj(structured_root)) {
+                yyjson_mut_val *structured = yyjson_val_mut_copy(doc, structured_root);
+                yyjson_mut_obj_add_val(doc, root, "structuredContent", structured);
+            }
+            yyjson_doc_free(structured_doc);
+        }
     }
+    yyjson_mut_obj_add_bool(doc, root, "isError", is_error);
 
     char *out = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
     return out;
 }
 
+bool cbm_mcp_cancel_request_matches(const char *params_json, int64_t active_id,
+                                    const char *active_id_str) {
+    if (!params_json) {
+        return false;
+    }
+
+    yyjson_doc *doc = yyjson_read(params_json, strlen(params_json), 0);
+    if (!doc) {
+        return false;
+    }
+
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *request_id = yyjson_obj_get(root, "requestId");
+    bool matches = false;
+    if (request_id) {
+        if (active_id_str) {
+            matches =
+                yyjson_is_str(request_id) && strcmp(yyjson_get_str(request_id), active_id_str) == 0;
+        } else {
+            matches = yyjson_is_int(request_id) && yyjson_get_int(request_id) == active_id;
+        }
+    }
+
+    yyjson_doc_free(doc);
+    return matches;
+}
+
 /* ── Tool definitions ─────────────────────────────────────────── */
 
 typedef struct {
     const char *name;
+    const char *title;
     const char *description;
     const char *input_schema; /* JSON string */
 } tool_def_t;
 
 static const tool_def_t TOOLS[] = {
-    {"index_repository",
+    {"index_repository", "Index repository",
      "Index a repository into the knowledge graph. "
      "Special mode 'cross-repo-intelligence': skip extraction, only match Routes/Channels "
      "across projects to create CROSS_HTTP_CALLS/CROSS_ASYNC_CALLS/CROSS_CHANNEL edges. "
@@ -287,12 +325,15 @@ static const tool_def_t TOOLS[] = {
      "\"target_projects\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},"
      "\"description\":\"Projects to search for cross-repo links (cross-repo-intelligence mode). "
      "Use [\\\"*\\\"] for all indexed projects. Run list_projects to see available projects.\"},"
+     "\"name\":{\"type\":\"string\",\"description\":"
+     "\"Override the derived project name. Non-ASCII bytes are encoded and unsafe path characters "
+     "are normalized.\"},"
      "\"persistence\":{\"type\":\"boolean\",\"default\":false,\"description\":"
      "\"Write compressed artifact to .codebase-memory/graph.db.zst for team sharing. "
      "Teammates can bootstrap from the artifact instead of full re-indexing.\"}"
      "},\"required\":[\"repo_path\"]}"},
 
-    {"search_graph",
+    {"search_graph", "Search graph",
      "Search the code knowledge graph for functions, classes, routes, and variables. Use INSTEAD "
      "OF grep/glob when finding code definitions, implementations, or relationships. Three search "
      "modes: (1) query='update settings' for BM25 ranked full-text search with camelCase "
@@ -329,7 +370,7 @@ static const tool_def_t TOOLS[] = {
      "increment offset by limit and re-call while has_more is true.\"}},"
      "\"required\":[\"project\"]}"},
 
-    {"query_graph",
+    {"query_graph", "Query graph",
      "Execute a Cypher query against the knowledge graph for complex multi-hop patterns, "
      "aggregations, and cross-service analysis. The response includes 'total' (returned "
      "row count). There is a hard 100k row ceiling — for broad queries add LIMIT in the "
@@ -352,7 +393,7 @@ static const tool_def_t TOOLS[] = {
      "ceiling. No offset support — use search_graph for paginated browsing.\"}},"
      "\"required\":[\"query\",\"project\"]}"},
 
-    {"trace_path",
+    {"trace_path", "Trace path",
      "Trace paths through the code graph. Modes: calls (callers/callees), data_flow (value "
      "propagation with args at each hop), cross_service (through HTTP/async Route nodes). "
      "Use INSTEAD OF grep for callers, dependencies, impact analysis, or data flow tracing.",
@@ -373,7 +414,7 @@ static const tool_def_t TOOLS[] = {
      "filtered out. When true, test nodes are included with is_test=true marker."
      "\"}},\"required\":[\"function_name\",\"project\"]}"},
 
-    {"get_code_snippet",
+    {"get_code_snippet", "Get code snippet",
      "Read source code for a function/class/symbol. IMPORTANT: First call search_graph to find the "
      "exact qualified_name, then pass it here. This is a read tool, not a search tool. Accepts "
      "full qualified_name (exact match) or short function name (returns suggestions if ambiguous).",
@@ -382,11 +423,12 @@ static const tool_def_t TOOLS[] = {
      "\"type\":\"string\"},\"include_neighbors\":{"
      "\"type\":\"boolean\",\"default\":false}},\"required\":[\"qualified_name\",\"project\"]}"},
 
-    {"get_graph_schema", "Get the schema of the knowledge graph (node labels, edge types)",
+    {"get_graph_schema", "Get graph schema",
+     "Get the schema of the knowledge graph (node labels, edge types)",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"}},\"required\":["
      "\"project\"]}"},
 
-    {"get_architecture",
+    {"get_architecture", "Get architecture",
      "Get high-level architecture overview — packages, services, dependencies, and project "
      "structure at a glance. Includes 'clusters': Leiden community detection over the call/import "
      "graph, surfacing the de-facto modules (each with a label, member count, cohesion score, "
@@ -399,7 +441,7 @@ static const tool_def_t TOOLS[] = {
      "\"aspects\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[\"project\"]"
      "}"},
 
-    {"search_code",
+    {"search_code", "Search code",
      "Graph-augmented code search. Finds text patterns via grep, then enriches results with "
      "the knowledge graph: deduplicates matches into containing functions, ranks by structural "
      "importance (definitions first, popular functions next, tests last). "
@@ -423,17 +465,17 @@ static const tool_def_t TOOLS[] = {
      "offset parameter — raise limit or narrow with file_pattern / path_filter to see more."
      "\",\"default\":10}},\"required\":[\"pattern\",\"project\"]}"},
 
-    {"list_projects", "List all indexed projects", "{\"type\":\"object\",\"properties\":{}}"},
-
-    {"delete_project", "Delete a project from the index",
+    {"list_projects", "List projects", "List all indexed projects",
+     "{\"type\":\"object\",\"properties\":{}}"},
+    {"delete_project", "Delete project", "Delete a project from the index",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"}},\"required\":["
      "\"project\"]}"},
 
-    {"index_status", "Get the indexing status of a project",
+    {"index_status", "Index status", "Get the indexing status of a project",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"}},\"required\":["
      "\"project\"]}"},
 
-    {"detect_changes", "Detect code changes and their impact",
+    {"detect_changes", "Detect changes", "Detect code changes and their impact",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"scope\":{\"type\":"
      "\"string\"},\"depth\":{\"type\":\"integer\",\"default\":2},\"base_branch\":{\"type\":"
      "\"string\",\"default\":\"main\"},\"since\":{\"type\":\"string\",\"description\":"
@@ -441,13 +483,13 @@ static const tool_def_t TOOLS[] = {
      "\"required\":"
      "[\"project\"]}"},
 
-    {"manage_adr", "Create or update Architecture Decision Records",
+    {"manage_adr", "Manage ADR", "Create or update Architecture Decision Records",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"mode\":{\"type\":"
      "\"string\",\"enum\":[\"get\",\"update\",\"sections\"]},\"content\":{\"type\":\"string\"},"
      "\"sections\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[\"project\"]"
      "}"},
 
-    {"ingest_traces", "Ingest runtime traces to enhance the knowledge graph",
+    {"ingest_traces", "Ingest traces", "Ingest runtime traces to enhance the knowledge graph",
      "{\"type\":\"object\",\"properties\":{\"traces\":{\"type\":\"array\",\"items\":{\"type\":"
      "\"object\"}},\"project\":{\"type\":"
      "\"string\"}},\"required\":[\"traces\",\"project\"]}"},
@@ -455,35 +497,109 @@ static const tool_def_t TOOLS[] = {
 
 static const int TOOL_COUNT = sizeof(TOOLS) / sizeof(TOOLS[0]);
 
-char *cbm_mcp_tools_list(void) {
+static const char MCP_TOOL_OUTPUT_SCHEMA[] = "{\"type\":\"object\",\"additionalProperties\":true}";
+
+static void mcp_add_json_schema(yyjson_mut_doc *doc, yyjson_mut_val *obj, const char *key,
+                                const char *schema_json) {
+    yyjson_doc *schema_doc = yyjson_read(schema_json, strlen(schema_json), 0);
+    if (schema_doc) {
+        yyjson_mut_val *schema = yyjson_val_mut_copy(doc, yyjson_doc_get_root(schema_doc));
+        if (schema) {
+            yyjson_mut_obj_add_val(doc, obj, key, schema);
+        }
+        yyjson_doc_free(schema_doc);
+    }
+}
+
+static void mcp_add_tool_def(yyjson_mut_doc *doc, yyjson_mut_val *tools, int i) {
+    yyjson_mut_val *tool = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_str(doc, tool, "name", TOOLS[i].name);
+    yyjson_mut_obj_add_str(doc, tool, "title", TOOLS[i].title);
+    yyjson_mut_obj_add_str(doc, tool, "description", TOOLS[i].description);
+
+    mcp_add_json_schema(doc, tool, "inputSchema", TOOLS[i].input_schema);
+    mcp_add_json_schema(doc, tool, "outputSchema", MCP_TOOL_OUTPUT_SCHEMA);
+
+    yyjson_mut_arr_add_val(tools, tool);
+}
+
+static char *cbm_mcp_tools_list_range(int offset, int limit, bool include_next_cursor) {
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
 
     yyjson_mut_val *tools = yyjson_mut_arr(doc);
 
-    for (int i = 0; i < TOOL_COUNT; i++) {
-        yyjson_mut_val *tool = yyjson_mut_obj(doc);
-        yyjson_mut_obj_add_str(doc, tool, "name", TOOLS[i].name);
-        yyjson_mut_obj_add_str(doc, tool, "description", TOOLS[i].description);
+    if (offset < 0) {
+        offset = 0;
+    }
+    if (offset > TOOL_COUNT) {
+        offset = TOOL_COUNT;
+    }
+    if (limit < 0 || limit > TOOL_COUNT) {
+        limit = TOOL_COUNT;
+    }
 
-        /* Parse input schema JSON and embed */
-        yyjson_doc *schema_doc =
-            yyjson_read(TOOLS[i].input_schema, strlen(TOOLS[i].input_schema), 0);
-        if (schema_doc) {
-            yyjson_mut_val *schema = yyjson_val_mut_copy(doc, yyjson_doc_get_root(schema_doc));
-            yyjson_mut_obj_add_val(doc, tool, "inputSchema", schema);
-            yyjson_doc_free(schema_doc);
-        }
+    int end = offset + limit;
+    if (end > TOOL_COUNT) {
+        end = TOOL_COUNT;
+    }
 
-        yyjson_mut_arr_add_val(tools, tool);
+    for (int i = offset; i < end; i++) {
+        mcp_add_tool_def(doc, tools, i);
     }
 
     yyjson_mut_obj_add_val(doc, root, "tools", tools);
+    if (include_next_cursor && end < TOOL_COUNT) {
+        char cursor[32];
+        snprintf(cursor, sizeof(cursor), "%d", end);
+        yyjson_mut_obj_add_strcpy(doc, root, "nextCursor", cursor);
+    }
 
     char *out = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
     return out;
+}
+
+char *cbm_mcp_tools_list(void) {
+    return cbm_mcp_tools_list_range(0, TOOL_COUNT, false);
+}
+
+static int mcp_tools_cursor_offset(const char *params_json) {
+    if (!params_json) {
+        return 0;
+    }
+
+    yyjson_doc *doc = yyjson_read(params_json, strlen(params_json), 0);
+    if (!doc) {
+        return 0;
+    }
+
+    int offset = 0;
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *cursor = root ? yyjson_obj_get(root, "cursor") : NULL;
+    if (cursor) {
+        offset = TOOL_COUNT;
+        if (yyjson_is_str(cursor)) {
+            const char *cursor_str = yyjson_get_str(cursor);
+            if (cursor_str && *cursor_str != '\0') {
+                char *endptr = NULL;
+                errno = 0;
+                long parsed = strtol(cursor_str, &endptr, 10);
+                if (endptr && *endptr == '\0' && errno == 0 && parsed >= 0) {
+                    offset = parsed > TOOL_COUNT ? TOOL_COUNT : (int)parsed;
+                }
+            }
+        }
+    }
+
+    yyjson_doc_free(doc);
+    return offset;
+}
+
+static char *cbm_mcp_tools_list_page(const char *params_json) {
+    return cbm_mcp_tools_list_range(mcp_tools_cursor_offset(params_json), MCP_TOOLS_PAGE_SIZE,
+                                    true);
 }
 
 /* Supported protocol versions, newest first. The server picks the newest
@@ -531,6 +647,7 @@ char *cbm_mcp_initialize_response(const char *params_json) {
 
     yyjson_mut_val *caps = yyjson_mut_obj(doc);
     yyjson_mut_val *tools_cap = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_bool(doc, tools_cap, "listChanged", false);
     yyjson_mut_obj_add_val(doc, caps, "tools", tools_cap);
     yyjson_mut_obj_add_val(doc, root, "capabilities", caps);
 
@@ -644,6 +761,7 @@ struct cbm_mcp_server {
     /* Active pipeline tracking for cancellation support */
     cbm_pipeline_t *active_pipeline; /* non-NULL while index_repository runs */
     int64_t active_request_id;       /* JSON-RPC id of the in-progress tool call */
+    char *active_request_id_str;     /* string JSON-RPC id of the in-progress tool call */
 };
 
 cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path) {
@@ -703,6 +821,7 @@ void cbm_mcp_server_free(cbm_mcp_server_t *srv) {
         cbm_store_close(srv->store);
     }
     free(srv->current_project);
+    free(srv->active_request_id_str);
     free(srv);
 }
 
@@ -2918,15 +3037,18 @@ static bool build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *
 static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     char *repo_path = cbm_mcp_get_string_arg(args, "repo_path");
     char *mode_str = cbm_mcp_get_string_arg(args, "mode");
+    char *name_override = cbm_mcp_get_string_arg(args, "name");
     cbm_normalize_path_sep(repo_path);
 
     if (!repo_path) {
         free(mode_str);
+        free(name_override);
         return cbm_mcp_text_result("repo_path is required", true);
     }
 
     if (mode_str && strcmp(mode_str, "cross-repo-intelligence") == 0) {
         free(mode_str);
+        free(name_override);
         char *result = handle_cross_repo_mode(repo_path, args);
         free(repo_path);
         return result;
@@ -2944,9 +3066,17 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
 
     cbm_pipeline_t *p = cbm_pipeline_new(repo_path, NULL, mode);
     if (!p) {
+        free(name_override);
         free(repo_path);
         return cbm_mcp_text_result("failed to create pipeline", true);
     }
+    if (name_override && name_override[0] && !cbm_pipeline_set_project_name(p, name_override)) {
+        cbm_pipeline_free(p);
+        free(name_override);
+        free(repo_path);
+        return cbm_mcp_text_result("invalid project name", true);
+    }
+    free(name_override);
     cbm_pipeline_set_persistence(p, persistence);
 
     char *project_name = heap_strdup(cbm_pipeline_project_name(p));
@@ -4962,18 +5092,21 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
     /* Notifications (no id) → handle cancellation, then no response */
     if (!req.has_id) {
         if (req.method && strcmp(req.method, "notifications/cancelled") == 0) {
-            /* MCP cancellation: cancel the active pipeline if request ID matches */
-            if (srv->active_pipeline) {
+            if (srv->active_pipeline &&
+                cbm_mcp_cancel_request_matches(req.params_raw, srv->active_request_id,
+                                               srv->active_request_id_str)) {
                 cbm_pipeline_cancel(srv->active_pipeline);
-                cbm_log_info("mcp.cancelled", "request_id_active",
-                             srv->active_request_id > 0 ? "yes" : "none");
+                cbm_log_info("mcp.cancelled", "match", "true");
             }
         }
         cbm_jsonrpc_request_free(&req);
         return NULL;
     }
 
+    struct timespec req_t0;
+    cbm_clock_gettime(CLOCK_MONOTONIC, &req_t0);
     char *result_json = NULL;
+    bool request_logged = false;
 
     if (strcmp(req.method, "initialize") == 0) {
         result_json = cbm_mcp_initialize_response(req.params_raw);
@@ -4983,21 +5116,31 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
     } else if (strcmp(req.method, "ping") == 0) {
         result_json = heap_strdup("{}");
     } else if (strcmp(req.method, "tools/list") == 0) {
-        result_json = cbm_mcp_tools_list();
+        result_json = cbm_mcp_tools_list_page(req.params_raw);
     } else if (strcmp(req.method, "tools/call") == 0) {
         char *tool_name = req.params_raw ? cbm_mcp_get_tool_name(req.params_raw) : NULL;
         char *tool_args =
             req.params_raw ? cbm_mcp_get_arguments(req.params_raw) : heap_strdup("{}");
+        srv->active_request_id = req.id;
+        free(srv->active_request_id_str);
+        srv->active_request_id_str = req.id_str ? heap_strdup(req.id_str) : NULL;
 
         struct timespec t0;
         cbm_clock_gettime(CLOCK_MONOTONIC, &t0);
         result_json = cbm_mcp_handle_tool(srv, tool_name, tool_args);
+        srv->active_request_id = CBM_NOT_FOUND;
+        free(srv->active_request_id_str);
+        srv->active_request_id_str = NULL;
         struct timespec t1;
         cbm_clock_gettime(CLOCK_MONOTONIC, &t1);
         long long dur_us = ((long long)(t1.tv_sec - t0.tv_sec) * MCP_S_TO_US) +
                            ((long long)(t1.tv_nsec - t0.tv_nsec) / MCP_MS_TO_US);
         bool is_err = (result_json != NULL) && (strstr(result_json, "\"isError\":true") != NULL);
         cbm_diag_record_query(dur_us, is_err);
+        long long request_dur_us = ((long long)(t1.tv_sec - req_t0.tv_sec) * MCP_S_TO_US) +
+                                   ((long long)(t1.tv_nsec - req_t0.tv_nsec) / MCP_MS_TO_US);
+        cbm_log_mcp_request(req.method, tool_name, is_err, request_dur_us);
+        request_logged = true;
 
         result_json = inject_update_notice(srv, result_json);
         free(tool_name);
@@ -5013,8 +5156,21 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
             .error_json = err_obj,
         };
         char *err = cbm_jsonrpc_format_response(&err_resp);
+        struct timespec t1;
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t1);
+        long long dur_us = ((long long)(t1.tv_sec - req_t0.tv_sec) * MCP_S_TO_US) +
+                           ((long long)(t1.tv_nsec - req_t0.tv_nsec) / MCP_MS_TO_US);
+        cbm_log_mcp_request(req.method, NULL, true, dur_us);
         cbm_jsonrpc_request_free(&req);
         return err;
+    }
+
+    if (!request_logged) {
+        struct timespec t1;
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t1);
+        long long dur_us = ((long long)(t1.tv_sec - req_t0.tv_sec) * MCP_S_TO_US) +
+                           ((long long)(t1.tv_nsec - req_t0.tv_nsec) / MCP_MS_TO_US);
+        cbm_log_mcp_request(req.method, NULL, false, dur_us);
     }
 
     cbm_jsonrpc_response_t resp = {

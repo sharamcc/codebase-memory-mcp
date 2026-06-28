@@ -429,7 +429,7 @@ int main(int argc, char **argv) {
                                       * No more untracked heap blind spots. */
     /* Store binary path for subprocess spawning + hook log sink */
     cbm_http_server_set_binary_path(argv[0]);
-    cbm_log_set_sink(cbm_ui_log_append);
+    cbm_log_set_sink_ex(cbm_ui_log_append, CBM_LOG_SINK_TEE);
     cbm_log_info("server.start", "version", CBM_VERSION);
     cbm_diag_start(); /* starts if CBM_DIAGNOSTICS=1 */
 
