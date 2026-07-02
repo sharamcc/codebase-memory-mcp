@@ -3857,10 +3857,13 @@ static void build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped
     const char *flag = use_regex ? "-E" : "-F";
     if (scoped) {
         if (file_pattern) {
-            snprintf(cmd, cmd_sz, "xargs grep -Hn %s --include='%s' -f '%s' < '%s' 2>/dev/null",
+            /* -0: read NUL-separated paths from the filelist so paths containing
+             * spaces stay one argument (issue #687). Pairs with the NUL separator
+             * written by write_scoped_filelist. */
+            snprintf(cmd, cmd_sz, "xargs -0 grep -Hn %s --include='%s' -f '%s' < '%s' 2>/dev/null",
                      flag, file_pattern, tmpfile, filelist);
         } else {
-            snprintf(cmd, cmd_sz, "xargs grep -Hn %s -f '%s' < '%s' 2>/dev/null", flag, tmpfile,
+            snprintf(cmd, cmd_sz, "xargs -0 grep -Hn %s -f '%s' < '%s' 2>/dev/null", flag, tmpfile,
                      filelist);
         }
     } else {
@@ -4276,10 +4279,22 @@ static bool write_scoped_filelist(cbm_mcp_server_t *srv, const char *project, co
     bool ok = false;
     if (fl) {
         for (int fi = 0; fi < indexed_count; fi++) {
-            /* Use forward slashes so xargs doesn't interpret Windows
-             * backslashes as escape sequences (e.g. \n becomes newline).
-             * Binary mode to prevent CRLF (xargs would see trailing \r). */
-            (void)fprintf(fl, "%s/%s\n", root_path, indexed_files[fi]);
+            /* Write "<root>/<file>" piece-by-piece (no fixed-size buffer, so an
+             * arbitrarily long absolute path cannot overflow). Forward slash join
+             * so xargs doesn't treat Windows backslashes as escapes; binary mode
+             * (wb) prevents CRLF translation. Record separator differs by platform:
+             *   - Unix: NUL, consumed by `xargs -0` — handles spaces in paths (a
+             *     newline separator would split plain xargs on the space).
+             *   - Windows: newline, consumed by PowerShell `Get-Content |
+             *     Select-String -LiteralPath` (NUL bytes break Get-Content). */
+            (void)fwrite(root_path, 1, strlen(root_path), fl);
+            (void)fputc('/', fl);
+            (void)fwrite(indexed_files[fi], 1, strlen(indexed_files[fi]), fl);
+#ifdef _WIN32
+            (void)fputc('\n', fl);
+#else
+            (void)fputc('\0', fl);
+#endif
         }
         (void)fclose(fl);
         ok = true;
